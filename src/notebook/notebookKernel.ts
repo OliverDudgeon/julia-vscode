@@ -28,6 +28,14 @@ const notifyTypeStreamoutput = new NotificationType<{
     name: string
     data: string
 }>('streamoutput')
+type ProgressUpdate = {
+    id: string
+    parentid: string
+    name: string
+    fraction: number | null
+    done: boolean
+}
+const notifyTypeProgress = new NotificationType<ProgressUpdate>('notebook/updateProgress')
 const requestTypeRunCell = new RequestType<
     { filename: string; line: number; column: number; code: string },
     { success: boolean; error: { message: string; name: string; stack: string } },
@@ -98,17 +106,16 @@ export class JuliaKernel {
     }
 
     public async queueCell(cell: vscode.NotebookCell): Promise<void> {
-        // First clear output
+        // Clear prior outputs so each run shows fresh output
         const clearOutputExecution = this.controller.createNotebookCellExecution(cell)
         clearOutputExecution.start()
         await clearOutputExecution.clearOutput()
         clearOutputExecution.end(undefined)
 
-        // Now create execution object that actually will run the code
+        // Create execution object that will run the code
         const execution = this.controller.createNotebookCellExecution(cell)
         execution.token.onCancellationRequested(() => {
             execution.end(undefined)
-            this.interrupt()
         })
         this._scheduledExecutionRequests.push(execution)
 
@@ -116,8 +123,15 @@ export class JuliaKernel {
     }
 
     private async messageLoop(token: CancellationToken) {
+        const finalizeIfCancelled = () => {
+            if (this._currentExecutionRequest && token.isCancellationRequested) {
+                this.finalizeActiveExecution('Kernel stopped')
+            }
+        }
+
         while (true) {
             if (token.isCancellationRequested) {
+                finalizeIfCancelled()
                 return
             }
 
@@ -135,12 +149,67 @@ export class JuliaKernel {
                     const runStartTime = Date.now()
                     this._currentExecutionRequest.start(runStartTime)
 
-                    const result = await this._msgConnection.sendRequest(requestTypeRunCell, {
-                        filename: cellPath,
-                        line: 0,
-                        column: 0,
-                        code: this._currentExecutionRequest.cell.document.getText(),
+                    let result: { success: boolean; error: { message: string; name: string; stack: string } }
+                    if (this._currentExecutionRequest.token.isCancellationRequested) {
+                        const message = 'Execution cancelled'
+                        this._currentExecutionRequest.appendOutput(
+                            new vscode.NotebookCellOutput([
+                                vscode.NotebookCellOutputItem.error({ name: 'Error', message, stack: '' }),
+                            ])
+                        )
+                        const runEndTime = Date.now()
+                        this._currentExecutionRequest.end(false, runEndTime)
+                        this._currentExecutionRequest = null
+                        this._onCellRunFinished.fire()
+                        continue
+                    }
+                    const cancelPromise = new Promise<never>((_, reject) => {
+                        const disp = this._currentExecutionRequest.token.onCancellationRequested(() => {
+                            disp.dispose()
+                            reject(new Error('Execution cancelled'))
+                        })
                     })
+
+                    try {
+                        result = await Promise.race([
+                            this._msgConnection.sendRequest(
+                                requestTypeRunCell,
+                                {
+                                    filename: cellPath,
+                                    line: 0,
+                                    column: 0,
+                                    code: this._currentExecutionRequest.cell.document.getText(),
+                                },
+                                this._currentExecutionRequest.token
+                            ),
+                            cancelPromise,
+                        ])
+                    } catch (err) {
+                        const execution = this._currentExecutionRequest
+                        if (!execution) {
+                            continue
+                        }
+                        const message = err instanceof Error ? err.message : 'Execution interrupted'
+                        const stack = err instanceof Error && typeof err.stack === 'string' ? err.stack : ''
+                        execution.appendOutput(
+                            new vscode.NotebookCellOutput([
+                                vscode.NotebookCellOutputItem.error({
+                                    name: 'Error',
+                                    message,
+                                    stack,
+                                }),
+                            ])
+                        )
+                        const runEndTime = Date.now()
+                        execution.end(false, runEndTime)
+                        this._currentExecutionRequest = null
+                        this._onCellRunFinished.fire()
+                        continue
+                    }
+
+                    if (!this._currentExecutionRequest) {
+                        continue
+                    }
 
                     if (this.stopDebugSessionAfterExecution && this.activeDebugSession) {
                         vscode.debug.stopDebugging(this.activeDebugSession)
@@ -160,6 +229,7 @@ export class JuliaKernel {
                 this._onCellRunFinished.fire()
 
                 if (token.isCancellationRequested) {
+                    finalizeIfCancelled()
                     return
                 }
             }
@@ -278,6 +348,14 @@ export class JuliaKernel {
                     vscode.NotebookCellExecution,
                     { output: vscode.NotebookCellOutput | undefined; name: 'stdout' | 'stderr' }
                 >()
+                type ProgressTiming = { start: number; last: number }
+                type ProgressState = {
+                    nodes: Map<string, ProgressUpdate>
+                    order: string[]
+                    timings: Map<string, ProgressTiming>
+                    output?: vscode.NotebookCellOutput
+                }
+                const progressPerExecution = new WeakMap<vscode.NotebookCellExecution, ProgressState>()
                 this._msgConnection.onNotification(notifyTypeStreamoutput, ({ name, data }) => {
                     const execution = this._currentExecutionRequest
                     if (!execution) {
@@ -305,7 +383,73 @@ export class JuliaKernel {
                     }
                 })
 
+                this._msgConnection.onNotification(notifyTypeProgress, (progress) => {
+                    const execution = this._currentExecutionRequest
+                    if (!execution) {
+                        return
+                    }
+
+                    const state = progressPerExecution.get(execution) ?? {
+                        nodes: new Map<string, ProgressUpdate>(),
+                        order: [],
+                        timings: new Map<string, ProgressTiming>(),
+                    }
+
+                    const updated = progress.done
+                        ? {
+                              ...progress,
+                              fraction: progress.fraction === null ? 1 : progress.fraction,
+                              done: true,
+                          }
+                        : progress
+
+                    if (!state.order.includes(progress.id)) {
+                        state.order.push(progress.id)
+                    }
+                    state.nodes.set(progress.id, updated)
+
+                    const now = Date.now()
+                    const timing = state.timings.get(progress.id) ?? { start: now, last: now }
+                    timing.last = now
+                    state.timings.set(progress.id, timing)
+
+                    const html = renderProgressHtml(state)
+
+                    const currentOutputs = execution.cell.outputs
+                    const existingIndex = currentOutputs.findIndex((o) => o.metadata?.jlvscodeProgress === true)
+                    const existing = existingIndex === -1 ? undefined : currentOutputs[existingIndex]
+
+                    if (html === null) {
+                        if (existing) {
+                            execution.replaceOutput(
+                                currentOutputs.filter((_, idx) => idx !== existingIndex)
+                            )
+                        }
+                        progressPerExecution.set(execution, { ...state, output: undefined })
+                        return
+                    }
+
+                    if (existing) {
+                        execution.replaceOutputItems(
+                            [vscode.NotebookCellOutputItem.text(html, 'text/html')],
+                            existing
+                        )
+                        progressPerExecution.set(execution, { ...state, output: existing })
+                    } else {
+                        const progressOutput = new vscode.NotebookCellOutput(
+                            [vscode.NotebookCellOutputItem.text(html, 'text/html')],
+                            { jlvscodeProgress: true }
+                        )
+                        execution.appendOutput(progressOutput)
+                        progressPerExecution.set(execution, { ...state, output: progressOutput })
+                    }
+                })
+
                 this._msgConnection.listen()
+
+                this._msgConnection.onClose(() => {
+                    this.finalizeActiveExecution('Kernel disconnected')
+                })
 
                 this._onConnected.fire(null)
 
@@ -378,10 +522,10 @@ export class JuliaKernel {
             const processExecutionRequests = this._processExecutionRequests
 
             this._kernelProcess.on('close', async (code) => {
+                this.finalizeActiveExecution('Kernel stopped')
                 tokenSource.cancel()
                 processExecutionRequests.notify()
 
-                this._onCellRunFinished.fire()
                 this._onStopped.fire(undefined)
                 outputChannel.appendLine(`Kernel closed with ${code}.`)
                 this._kernelProcess = undefined
@@ -418,4 +562,157 @@ export class JuliaKernel {
     public async interrupt() {
         this._kernelProcess?.kill('SIGINT')
     }
+
+    private finalizeActiveExecution(reason: string) {
+        const execution = this._currentExecutionRequest
+        if (!execution) {
+            return
+        }
+
+        execution.appendOutput(
+            new vscode.NotebookCellOutput([
+                vscode.NotebookCellOutputItem.error({ name: 'Error', message: reason, stack: '' }),
+            ])
+        )
+
+        const endTime = Date.now()
+        execution.end(false, endTime)
+        this._currentExecutionRequest = null
+        this._onCellRunFinished.fire()
+    }
+}
+
+function renderProgressHtml(state: { nodes: Map<string, ProgressUpdate>; order: string[]; timings: Map<string, { start: number; last: number }> }): string | null {
+    if (state.nodes.size === 0) {
+        return null
+    }
+
+    const escapeHtml = (value: string) =>
+        value
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;')
+
+    const depthCache = new Map<string, number>()
+    const depthOf = (id: string): number => {
+        if (depthCache.has(id)) {
+            return depthCache.get(id)!
+        }
+        let depth = 0
+        let cursor = state.nodes.get(id)
+        const seen = new Set<string>()
+        while (cursor && cursor.parentid && !seen.has(cursor.parentid)) {
+            seen.add(cursor.parentid)
+            if (!state.nodes.has(cursor.parentid)) {
+                break
+            }
+            depth += 1
+            cursor = state.nodes.get(cursor.parentid)
+        }
+        depthCache.set(id, depth)
+        return depth
+    }
+
+    const now = Date.now()
+
+    const MAX_ROWS = 10
+    const activeRows = state.order
+        .map((id) => state.nodes.get(id))
+        .filter((p): p is ProgressUpdate => !!p)
+        .map((progress) => ({ progress, depth: depthOf(progress.id) }))
+
+    let rowsForRender = activeRows
+    let truncated = false
+    if (activeRows.length > MAX_ROWS) {
+        truncated = true
+        rowsForRender = [...activeRows]
+        while (rowsForRender.length > MAX_ROWS) {
+            let removeIdx = 0
+            let maxDepth = -1
+            for (let i = 0; i < rowsForRender.length; i++) {
+                if (rowsForRender[i].depth > maxDepth) {
+                    maxDepth = rowsForRender[i].depth
+                    removeIdx = i
+                }
+            }
+            rowsForRender.splice(removeIdx, 1)
+        }
+    }
+
+    const rows = rowsForRender
+        .map(({ progress, depth }) => {
+            const label = progress.name && progress.name.length > 0 ? progress.name : 'Progress'
+            const fraction = progress.fraction
+            const bounded = typeof fraction === 'number' ? Math.max(0, Math.min(1, fraction)) : null
+            const pctText = bounded === null ? '—' : `${Math.floor(bounded * 100)}%`
+            const width = bounded === null ? 100 : bounded * 100
+            const doneClass = progress.done || (bounded !== null && bounded >= 1) ? 'done' : ''
+            const indeterminate = bounded === null
+            const timing = state.timings.get(progress.id)
+            const elapsedMs = timing ? (progress.done ? timing.last - timing.start : now - timing.start) : 0
+            const etaMs = !progress.done && bounded !== null && bounded > 0 && bounded < 1 ? elapsedMs * (1 / bounded - 1) : null
+            const elapsedText = formatDuration(elapsedMs)
+            const etaText = etaMs === null ? '' : `ETA ${formatDuration(etaMs)}`
+            const timeText = progress.done ? `Elapsed ${elapsedText}` : etaText || `Elapsed ${elapsedText}`
+            return {
+                depth,
+                label: escapeHtml(label),
+                pctText,
+                width,
+                doneClass,
+                indeterminate,
+                id: progress.id,
+                timeText,
+            }
+        })
+
+    const barRows = rows
+        .map((row) => {
+            const indent = row.depth * 12
+            const fillStyle = row.indeterminate ? 'width: 100%; opacity: 0.35;' : `width: ${row.width}%;`
+            return `<div class="jl-nb-progress-row ${row.doneClass}" style="padding-left:${indent}px">
+                <div class="jl-nb-progress-label">${row.label}</div>
+                <div class="jl-nb-progress-bar"><div class="jl-nb-progress-fill" style="${fillStyle}"></div></div>
+                <div class="jl-nb-progress-pct">${row.pctText}</div>
+                <div class="jl-nb-progress-time">${row.timeText}</div>
+            </div>`
+        })
+        .join('')
+
+    const truncatedRow = truncated
+        ? `<div class="jl-nb-progress-trunc">… ${activeRows.length - MAX_ROWS} more not shown</div>`
+        : ''
+
+    const styles = `
+<style>
+.jl-nb-progress-panel { font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; margin-top: 6px; border: 1px solid var(--vscode-panel-border, #ccc); border-radius: 4px; padding: 6px; background: var(--vscode-editor-background, #fff); width: 100%; box-sizing: border-box; overflow: hidden; }
+.jl-nb-progress-row { display: grid; grid-template-columns: auto 1fr auto auto; align-items: center; gap: 6px; margin-bottom: 4px; width: 100%; box-sizing: border-box; }
+.jl-nb-progress-row:last-child { margin-bottom: 0; }
+.jl-nb-progress-label { color: var(--vscode-editor-foreground, #222); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.jl-nb-progress-bar { position: relative; height: 8px; background: var(--vscode-editor-lineHighlightBackground, #e5e5e5); border-radius: 4px; overflow: hidden; width: 100%; box-sizing: border-box; }
+.jl-nb-progress-fill { position: absolute; inset: 0; background: linear-gradient(90deg, var(--vscode-progressBar-background, #0b8aee), var(--vscode-progressBar-background, #0b8aee)); transition: width 120ms ease-out; }
+.jl-nb-progress-row.done .jl-nb-progress-fill { background: var(--vscode-charts-green, #2e9d32); }
+.jl-nb-progress-pct { color: var(--vscode-descriptionForeground, #666); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.jl-nb-progress-time { color: var(--vscode-descriptionForeground, #666); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.jl-nb-progress-trunc { color: var(--vscode-descriptionForeground, #666); font-style: italic; margin-top: 4px; }
+</style>`
+
+    return `${styles}<div class="jl-nb-progress-panel">${barRows}${truncatedRow}</div>`
+}
+
+function formatDuration(ms: number): string {
+    if (!isFinite(ms) || ms < 0) {
+        return '—'
+    }
+    const totalSeconds = Math.max(0, Math.round(ms / 1000))
+    const hours = Math.floor(totalSeconds / 3600)
+    const minutes = Math.floor((totalSeconds % 3600) / 60)
+    const seconds = totalSeconds % 60
+    const pad = (n: number) => (n < 10 ? `0${n}` : `${n}`)
+    if (hours > 0) {
+        return `${hours}:${pad(minutes)}:${pad(seconds)}`
+    }
+    return `${minutes}:${pad(seconds)}`
 }

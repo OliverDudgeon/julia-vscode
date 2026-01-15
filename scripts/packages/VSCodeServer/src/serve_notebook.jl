@@ -8,69 +8,103 @@ end
 const notebook_runcell_request_type = JSONRPC.RequestType("notebook/runcell", NotebookRunCellArguments, NamedTuple{(:success, :error),Tuple{Bool,NamedTuple{(:message, :name, :stack),Tuple{String,String,String}}}})
 
 function notebook_runcell_request(conn, params::NotebookRunCellArguments, token)
-    code = string('\n'^params.line, ' '^params.column, params.code)
+    try
+        code = string('\n'^params.line, ' '^params.column, params.code)
 
-    withpath(params.filename) do
-        revise()
+        withpath(params.filename) do
+            revise()
 
-        args = VERSION >= v"1.5" ? (REPL.softscope, Main, code, params.filename) : (Main, code, params.filename)
+            args = VERSION >= v"1.5" ? (REPL.softscope, Main, code, params.filename) : (Main, code, params.filename)
 
-        result = try
-            if isready(DEBUG_SESSION[])
-                debug_session = fetch(DEBUG_SESSION[])
+            result = try
+                Logging.with_logger(NotebookProgressLogger(Logging.current_logger())) do
+                    if isready(DEBUG_SESSION[])
+                        debug_session = fetch(DEBUG_SESSION[])
 
-                DebugAdapter.debug_code(debug_session, Main, code, params.filename)
-            else
-                Base.invokelatest(include_string, args...)
-            end
-        catch err
-            bt = crop_backtrace(catch_backtrace())
-
-            if err isa LoadError
-                inner_err = err.error
-                error_type = string(typeof(inner_err))
-
-                try
-                    error_message_str = Base.invokelatest(sprint, showerror, inner_err)
-                    traceback = Base.invokelatest(sprint, Base.show_backtrace, bt)
-
-                    flush(stdout)
-                    flush(stderr)
-
-                    return (success = false, error = (message = error_message_str, name = error_type, stack = string(error_message_str, "\n", traceback)))
-                catch err
-                    return (success = false, error = (message = "Error trying to display an error.", name = error_type, stack = "Error trying to display an error."))
+                        DebugAdapter.debug_code(debug_session, Main, code, params.filename)
+                    else
+                        Base.invokelatest(include_string, args...)
+                    end
                 end
-            else
-                rethrow(err)
-                error("Not clear what this means, but we should probably send a crash report.")
-            end
-        end
-
-        IJuliaCore.flush_all()
-
-        if result !== nothing && !ends_with_semicolon(code)
-            try
-                Base.invokelatest(Base.display, result)
             catch err
-                error_type = string(typeof(err))
+                bt = crop_backtrace(catch_backtrace())
 
-                try
-                    bt = crop_backtrace(catch_backtrace())
+                if err isa InterruptException
+                    try
+                        error_message_str = "Execution interrupted"
+                        traceback = Base.invokelatest(sprint, Base.show_backtrace, bt)
 
-                    error_message_str = Base.invokelatest(sprint, showerror, err)
-                    traceback = Base.invokelatest(sprint, Base.show_backtrace, bt)
+                        flush(stdout)
+                        flush(stderr)
 
-                    return (success=false, error=(message=error_message_str, name=error_type, stack=string(error_message_str, "\n", traceback)))
-                catch err
-                    return (success=false, error=(message="Error trying to display an error.", name=error_type, stack="Error trying to display an error."))
+                        return (success = false, error = (message = error_message_str, name = string(typeof(err)), stack = string(error_message_str, "\n", traceback)))
+                    catch err
+                        return (success = false, error = (message = "Execution interrupted", name = string(typeof(err)), stack = ""))
+                    end
+                elseif err isa LoadError
+                    inner_err = err.error
+                    error_type = string(typeof(inner_err))
+
+                    try
+                        error_message_str = Base.invokelatest(sprint, showerror, inner_err)
+                        traceback = Base.invokelatest(sprint, Base.show_backtrace, bt)
+
+                        flush(stdout)
+                        flush(stderr)
+
+                        return (success = false, error = (message = error_message_str, name = error_type, stack = string(error_message_str, "\n", traceback)))
+                    catch err
+                        return (success = false, error = (message = "Error trying to display an error.", name = error_type, stack = "Error trying to display an error."))
+                    end
+                else
+                    rethrow(err)
                 end
             end
+
+            IJuliaCore.flush_all()
+
+            if result isa NamedTuple{(:success, :error)}
+                return result
+            end
+
+            if result !== nothing && !ends_with_semicolon(code)
+                try
+                    Base.invokelatest(Base.display, result)
+                catch err
+                    error_type = string(typeof(err))
+
+                    try
+                        bt = crop_backtrace(catch_backtrace())
+
+                        error_message_str = Base.invokelatest(sprint, showerror, err)
+                        traceback = Base.invokelatest(sprint, Base.show_backtrace, bt)
+
+                        return (success=false, error=(message=error_message_str, name=error_type, stack=string(error_message_str, "\n", traceback)))
+                    catch err
+                        return (success=false, error=(message="Error trying to display an error.", name=error_type, stack="Error trying to display an error."))
+                    end
+                end
+            end
+
+            IJuliaCore.flush_all()
+
+            return (success = true, error = (message = "", name = "", stack = ""))
         end
-
-        IJuliaCore.flush_all()
-
-        return (success = true, error = (message = "", name = "", stack = ""))
+    catch err
+        if err isa InterruptException
+            bt = crop_backtrace(catch_backtrace())
+            try
+                error_message_str = "Execution interrupted"
+                traceback = Base.invokelatest(sprint, Base.show_backtrace, bt)
+                flush(stdout)
+                flush(stderr)
+                return (success = false, error = (message = error_message_str, name = string(typeof(err)), stack = string(error_message_str, "\n", traceback)))
+            catch err
+                return (success = false, error = (message = "Execution interrupted", name = string(typeof(err)), stack = ""))
+            end
+        else
+            rethrow(err)
+        end
     end
 end
 
@@ -116,9 +150,6 @@ function serve_notebook(pipename, debugger_pipename, outputchannel_logger; error
             redirect_stderr(IJuliaCore.IJuliaStdio(Base.stderr, io_send_callback, "stderr"))
         end
         redirect_stdin(IJuliaCore.IJuliaStdio(Base.stdin, io_send_callback, "stdin"))
-
-        logger = Base.CoreLogging.SimpleLogger(Base.stderr)
-        Base.CoreLogging.global_logger(logger)
 
         Base.Multimedia.pushdisplay(JuliaNotebookInlineDisplay())
 

@@ -3,6 +3,11 @@ struct VSCodeLogger <: Logging.AbstractLogger
 end
 VSCodeLogger() = VSCodeLogger(nothing)
 
+struct NotebookProgressLogger <: Logging.AbstractLogger
+    parent::Union{Nothing, Logging.AbstractLogger}
+end
+NotebookProgressLogger() = NotebookProgressLogger(nothing)
+
 const logger_lock = ReentrantLock()
 function Logging.handle_message(j::VSCodeLogger, level, message, _module,
     group, id, file, line; kwargs...)
@@ -35,11 +40,53 @@ function Logging.handle_message(j::VSCodeLogger, level, message, _module,
     return nothing
 end
 
+function Logging.handle_message(j::NotebookProgressLogger, level, message, _module,
+    group, id, file, line; kwargs...)
+    isprogress = try_process_progress(level, message, _module, group, id, file, line; kwargs...) do progress
+        lock(logger_lock)
+        try
+            payload = Dict(
+                "id" => string(progress.id),
+                "parentid" => string(progress.parentid),
+                "name" => getfield(progress, :name),
+                "fraction" => getfield(progress, :fraction),
+                "done" => getfield(progress, :done),
+            )
+            JSONRPC.send_notification(conn_endpoint[], "notebook/updateProgress", payload)
+            JSONRPC.flush(conn_endpoint[])
+        catch err
+            @debug "Failed to send 'notebook/updateProgress' message" exception=(err, catch_backtrace())
+            return nothing
+        finally
+            unlock(logger_lock)
+        end
+    end isa Some
+
+    if isprogress
+        return nothing
+    end
+
+    previous_logger = get_previous_logger(j)
+
+    if (Base.invokelatest(Logging.min_enabled_level, previous_logger) <= Logging.LogLevel(level) ||
+        Base.CoreLogging.env_override_minlevel(group, _module)) &&
+       Base.invokelatest(Logging.shouldlog, previous_logger, level, _module, group, id)
+        Logging.handle_message(previous_logger, level, message, _module,
+            group, id, file, line; kwargs...)
+    end
+    return nothing
+end
+
 Logging.shouldlog(::VSCodeLogger, level, _module, group, id) = true
+Logging.shouldlog(::NotebookProgressLogger, level, _module, group, id) = true
 
 Logging.catch_exceptions(::VSCodeLogger) = true
+Logging.catch_exceptions(::NotebookProgressLogger) = true
 
 function Logging.min_enabled_level(j::VSCodeLogger)
+    min(Base.invokelatest(Logging.min_enabled_level, get_previous_logger(j)), Logging.LogLevel(-1))
+end
+function Logging.min_enabled_level(j::NotebookProgressLogger)
     min(Base.invokelatest(Logging.min_enabled_level, get_previous_logger(j)), Logging.LogLevel(-1))
 end
 
@@ -51,7 +98,15 @@ function prevent_logger_recursion(::VSCodeLogger)
     end
     return l
 end
+function prevent_logger_recursion(::NotebookProgressLogger)
+    l = FALLBACK_CONSOLE_LOGGER_REF[]
+    Logging.with_logger(l) do
+        @warn "Infinite recursion detected in logger setup. `VSCodeServer.NotebookProgressLogger` may not be used as a global logger!" _id=:vslogrecwarn maxlog=1
+    end
+    return l
+end
 get_previous_logger(j::VSCodeLogger) = prevent_logger_recursion(something(j.parent, Logging.global_logger()))
+get_previous_logger(j::NotebookProgressLogger) = prevent_logger_recursion(something(j.parent, Logging.global_logger()))
 
 const progresslogging_pkgid = Base.PkgId(
     Base.UUID("33c8b6b6-d38a-422a-b730-caa89a2f386c"),
@@ -69,9 +124,14 @@ function try_process_progress(f, args...; kwargs...)
     m = get(Base.loaded_modules, progresslogging_pkgid, nothing)
     m === nothing && return nothing
     isdefined(m, :asprogress) || return nothing
-    Base.invokelatest() do
-        progress = m.asprogress(args...; kwargs...)
-        progress === nothing && return nothing
-        return Some(f(progress))
+    try
+        Base.invokelatest() do
+            progress = m.asprogress(args...; kwargs...)
+            progress === nothing && return nothing
+            return Some(f(progress))
+        end
+    catch err
+        @debug "Failed to interpret log message as progress" exception = (err, catch_backtrace())
+        return nothing
     end
 end
