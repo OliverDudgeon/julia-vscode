@@ -4,6 +4,9 @@ import * as vscode from 'vscode'
 import { constructCommandString, getVersionedParamsAtPosition, onEvent, registerCommand } from '../utils'
 import { LanguageClientFeature } from '../languageClient'
 
+const liveDocumentationDebounceMs = 250
+const liveDocumentationSetting = 'liveDocumentation'
+
 function openArgs(href: string) {
     const matches = href.match(/^((\w+:\/\/)?.+?)(?:[:#](\d+))?$/)
     let uri
@@ -81,11 +84,34 @@ class DocumentationViewProvider implements vscode.WebviewViewProvider {
 
     private backStack = Array<string>() // also keep current page
     private forwardStack = Array<string>()
+    private liveDocumentationTimer: ReturnType<typeof setTimeout> | undefined = undefined
+    private liveDocumentationRequestId = 0
+    private lastCursorKey: string | undefined = undefined
 
     constructor(
         private context: vscode.ExtensionContext,
         private languageClientFeature: LanguageClientFeature
-    ) {}
+    ) {
+        this.context.subscriptions.push(
+            vscode.window.onDidChangeTextEditorSelection((e) => this.scheduleLiveDocumentationUpdate(e.textEditor)),
+            vscode.window.onDidChangeActiveTextEditor((editor) => this.scheduleLiveDocumentationUpdate(editor)),
+            vscode.workspace.onDidChangeConfiguration((e) => {
+                if (e.affectsConfiguration(`julia.${liveDocumentationSetting}`)) {
+                    if (this.liveDocumentationTimer) {
+                        clearTimeout(this.liveDocumentationTimer)
+                    }
+
+                    if (this.isLiveDocumentationEnabled()) {
+                        this.scheduleLiveDocumentationUpdate(vscode.window.activeTextEditor)
+                    }
+                }
+            })
+        )
+    }
+
+    private isLiveDocumentationEnabled() {
+        return vscode.workspace.getConfiguration('julia').get<boolean>(liveDocumentationSetting, true)
+    }
 
     resolveWebviewView(view: vscode.WebviewView) {
         this.view = view
@@ -104,6 +130,94 @@ class DocumentationViewProvider implements vscode.WebviewViewProvider {
             } else {
                 console.error('unknown message received')
             }
+        })
+
+        this.scheduleLiveDocumentationUpdate(vscode.window.activeTextEditor)
+    }
+
+    private scheduleLiveDocumentationUpdate(editor: vscode.TextEditor | undefined) {
+        if (!this.view) {
+            return
+        }
+
+        if (!this.isLiveDocumentationEnabled()) {
+            return
+        }
+
+        if (this.liveDocumentationTimer) {
+            clearTimeout(this.liveDocumentationTimer)
+        }
+
+        this.liveDocumentationTimer = setTimeout(() => {
+            this.updateDocumentationFromCursor(editor)
+        }, liveDocumentationDebounceMs)
+    }
+
+    private async updateDocumentationFromCursor(editor: vscode.TextEditor | undefined) {
+        if (!this.view || !editor) {
+            return
+        }
+
+        if (!this.isLiveDocumentationEnabled()) {
+            return
+        }
+
+        const position = editor.selection.active
+        const cursorKey = `${editor.document.uri.toString()}:${position.line}:${position.character}`
+        if (cursorKey === this.lastCursorKey) {
+            return
+        }
+
+        this.lastCursorKey = cursorKey
+
+        const requestId = ++this.liveDocumentationRequestId
+        const docAsMD = await this.getDocumentationFromHover(editor.document, position)
+
+        if (!this.view || requestId !== this.liveDocumentationRequestId) {
+            return
+        }
+
+        const docAsHTML = md.render(docAsMD || 'No documentation found for the symbol under cursor.')
+        this.view.webview.postMessage({
+            type: 'update-documentation',
+            html: docAsHTML,
+        })
+    }
+
+    private async getDocumentationFromHover(document: vscode.TextDocument, position: vscode.Position): Promise<string> {
+        const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+            'vscode.executeHoverProvider',
+            document.uri,
+            position
+        )
+
+        if (!hovers || hovers.length === 0) {
+            return ''
+        }
+
+        const pieces = hovers
+            .flatMap((hover) => this.hoverContentsToMarkdown(hover.contents))
+            .map((value) => value.trim())
+            .filter((value) => value.length > 0)
+
+        return pieces.join('\n\n')
+    }
+
+    private hoverContentsToMarkdown(
+        contents: vscode.MarkdownString | vscode.MarkedString | Array<vscode.MarkdownString | vscode.MarkedString>
+    ): string[] {
+        const values = Array.isArray(contents) ? contents : [contents]
+
+        return values.map((value) => {
+            if (value instanceof vscode.MarkdownString) {
+                return value.value
+            }
+
+            if (typeof value === 'string') {
+                return value
+            }
+
+            return `\`\`\`${value.language}\n${value.value}\n\`\`\``
         })
     }
 
@@ -286,7 +400,7 @@ class DocumentationViewProvider implements vscode.WebviewViewProvider {
             <input id="search-input" type="text" placeholder="Search"></input>
         </div>
         <div class="docs-main" style="padding: 50px 1em 1em 1em">
-            <article class="content">
+            <article id="docs-content" class="content">
                 ${docAsHTML}
             </article>
         </div>
@@ -307,6 +421,19 @@ class DocumentationViewProvider implements vscode.WebviewViewProvider {
                     search(val)
                 }
             }
+
+            window.addEventListener('message', (event) => {
+                const message = event.data
+                if (!message || message.type !== 'update-documentation') {
+                    return
+                }
+
+                const docsContent = document.getElementById('docs-content')
+                if (docsContent) {
+                    docsContent.innerHTML = message.html || ''
+                }
+            })
+
             document.getElementById('search-input').addEventListener('keydown', onKeyDown)
         </script>
     </body>

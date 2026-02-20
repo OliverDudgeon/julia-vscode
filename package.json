@@ -1060,6 +1060,11 @@
                     "default": true,
                     "description": "Display plots within VS Code. Might require a restart of the Julia process."
                 },
+                "julia.liveDocumentation": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Automatically update the Documentation pane based on the symbol under the cursor."
+                },
                 "julia.useCodeLens": {
                     "type": "boolean",
                     "default": true,
