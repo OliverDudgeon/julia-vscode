@@ -17,6 +17,7 @@ import { ErrorCodes, LSPErrorCodes, ResponseError } from 'vscode-languageserver-
 import * as jlpkgenv from './jlpkgenv'
 import * as telemetry from './telemetry'
 import { ExecutableFeature, JuliaExecutable } from './executables'
+import { transformHoverMath } from './utils/hoverMath'
 import { getCustomEnvironmentVariables, onEvent, registerCommand } from './utils'
 
 export const supportedSchemes = ['file', 'untitled', 'vscode-notebook-cell']
@@ -318,6 +319,17 @@ export class LanguageClientFeature {
             traceOutputChannel: this.traceOutputChannel,
             outputChannel: this.outputChannel,
             initializationOptions: { julialangTestItemIdentification: true },
+            middleware: {
+                provideHover: async (document, position, token, next) => {
+                    const hover = await next(document, position, token)
+
+                    if (!hover) {
+                        return hover
+                    }
+
+                    return transformHoverMath(hover)
+                },
+            },
         }
 
         // Create the language client and start the client.
