@@ -1060,6 +1060,12 @@
                     "default": true,
                     "description": "Display plots within VS Code. Might require a restart of the Julia process."
                 },
+                "julia.documentation.mathRendering": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Render LaTeX math in the documentation pane using MathJax. Disable this to show raw documentation math markup. You will need to use the language-julia.show-documentation command to trigger a rerender.",
+                    "scope": "window"
+                },
                 "julia.useCodeLens": {
                     "type": "boolean",
                     "default": true,
@@ -1708,7 +1714,6 @@
         "tagmajor": "npm version major && git push --tags && git push"
     },
     "dependencies": {
-        "@traptitech/markdown-it-katex": "^3.6.0",
         "@vscode/debugadapter": "^1.55.1",
         "@vscode/debugprotocol": "^1.55.1",
         "applicationinsights": "^2",
@@ -1718,6 +1723,8 @@
         "fastq": "^1.19.1",
         "markdown-it": "^14.1.0",
         "markdown-it-footnote": "^4.0.0",
+        "mathjax": "^3.2.2",
+        "promisify-child-process": "^4.1.1",
         "semver": "^7.3.5",
         "source-map-support": "^0.5.21",
         "uuid": "^13.0.0",

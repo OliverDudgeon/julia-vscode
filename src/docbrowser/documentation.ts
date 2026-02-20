@@ -4,6 +4,56 @@ import * as vscode from 'vscode'
 import { constructCommandString, getVersionedParamsAtPosition, onEvent, registerCommand } from '../utils'
 import { LanguageClientFeature } from '../languageClient'
 
+function getNonce() {
+    const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+    let result = ''
+
+    for (let i = 0; i < 32; i++) {
+        result += characters.charAt(Math.floor(Math.random() * characters.length))
+    }
+
+    return result
+}
+
+function normalizeDocumenterMathEquation(equation: string) {
+    const trimmedEquation = equation.trim()
+    const hasSingleEscapedCommands = /(^|[^\\])\\[A-Za-z]+/.test(trimmedEquation)
+    const hasDoubleEscapedCommands = /\\\\[A-Za-z]+/.test(trimmedEquation)
+
+    if (!hasDoubleEscapedCommands || hasSingleEscapedCommands) {
+        return trimmedEquation
+    }
+
+    const normalizeQuadrupleBackslashes = trimmedEquation.replace(/\\\\\\\\/g, '\\\\')
+    return normalizeQuadrupleBackslashes.replace(/\\\\(?=[A-Za-z])/g, '\\')
+}
+
+function preprocessDocumenterMath(markdown: string) {
+    const mathExpressions = new Map<string, string>()
+    let mathExpressionCounter = 0
+
+    const getToken = () => `JULIA_DOC_MATH_${mathExpressionCounter++}_TOKEN`
+
+    const withBlockMathTokens = markdown.replace(/```math[ \t]*\r?\n([\s\S]*?)\r?\n```/g, (_match, equation) => {
+        const token = getToken()
+        const normalizedEquation = normalizeDocumenterMathEquation(equation)
+        mathExpressions.set(token, `$$\n${normalizedEquation}\n$$`)
+        return token
+    })
+
+    const withAllMathTokens = withBlockMathTokens.replace(/``([^\n]+?)``/g, (_match, equation) => {
+        const token = getToken()
+        const normalizedEquation = normalizeDocumenterMathEquation(equation)
+        mathExpressions.set(token, `\(${normalizedEquation}\)`)
+        return token
+    })
+
+    return {
+        markdown: withAllMathTokens,
+        mathExpressions,
+    }
+}
+
 function openArgs(href: string) {
     const matches = href.match(/^((\w+:\/\/)?.+?)(?:[:#](\d+))?$/)
     let uri
@@ -18,13 +68,6 @@ function openArgs(href: string) {
 }
 
 const md = new markdownit()
-    .use(
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        require('@traptitech/markdown-it-katex'),
-        {
-            output: 'html',
-        }
-    )
     .use(
         // eslint-disable-next-line @typescript-eslint/no-require-imports
         require('markdown-it-footnote')
@@ -176,7 +219,21 @@ class DocumentationViewProvider implements vscode.WebviewViewProvider {
     }
 
     createWebviewHTML(docAsMD: string) {
-        const docAsHTML = md.render(docAsMD)
+        const enableMathRendering = vscode.workspace
+            .getConfiguration('julia')
+            .get<boolean>('documentation.mathRendering', true)
+
+        let docAsHTML: string
+        if (enableMathRendering) {
+            const preprocessed = preprocessDocumenterMath(docAsMD)
+            docAsHTML = md.render(preprocessed.markdown)
+            for (const [token, expression] of preprocessed.mathExpressions.entries()) {
+                docAsHTML = docAsHTML.split(token).join(expression)
+            }
+        } else {
+            docAsHTML = md.render(docAsMD)
+        }
+        const nonce = getNonce()
 
         const extensionPath = this.context.extensionPath
 
@@ -195,13 +252,28 @@ class DocumentationViewProvider implements vscode.WebviewViewProvider {
         const documenterStylesheetcss = this.view.webview.asWebviewUri(
             vscode.Uri.file(path.join(extensionPath, 'libs', 'documenter', 'documenter-vscode.css'))
         )
-        const katexcss = this.view.webview.asWebviewUri(
-            vscode.Uri.file(path.join(extensionPath, 'libs', 'katex', 'katex.min.css'))
-        )
+        const mathjaxjs = enableMathRendering
+            ? this.view.webview.asWebviewUri(
+                  vscode.Uri.file(path.join(extensionPath, 'node_modules', 'mathjax', 'es5', 'tex-chtml.js'))
+              )
+            : undefined
 
-        const webfontjs = this.view.webview.asWebviewUri(
-            vscode.Uri.file(path.join(extensionPath, 'libs', 'webfont', 'webfont.js'))
-        )
+        const mathJaxConfigScript = enableMathRendering
+            ? `<script nonce="${nonce}" type="text/javascript">
+            window.MathJax = {
+                tex: {
+                    inlineMath: [['\\(', '\\)']],
+                    displayMath: [['$$', '$$']],
+                    packages: { '[+]': ['ams', 'color', 'newcommand'] },
+                },
+                options: {
+                    skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'],
+                },
+            }
+        </script>`
+            : ''
+
+        const mathJaxScript = enableMathRendering && mathjaxjs ? `<script nonce="${nonce}" src=${mathjaxjs}></script>` : ''
 
         return `
     <html lang="en" class='theme--documenter-vscode'>
@@ -209,30 +281,27 @@ class DocumentationViewProvider implements vscode.WebviewViewProvider {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${this.view.webview.cspSource} https: data:; font-src ${this.view.webview.cspSource} data:; style-src ${this.view.webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
         <title>Julia Documentation Pane</title>
         <link href=${googleFontscss} rel="stylesheet" type="text/css" />
         <link href=${fontawesomecss} rel="stylesheet" type="text/css" />
         <link href=${solidcss} rel="stylesheet" type="text/css" />
         <link href=${brandscss} rel="stylesheet" type="text/css" />
-        <link href=${katexcss} rel="stylesheet" type="text/css" />
         <link href=${documenterStylesheetcss} rel="stylesheet" type="text/css">
 
-        <script type="text/javascript">
-            WebFontConfig = {
-                custom: {
-                    families: ['KaTeX_AMS', 'KaTeX_Caligraphic:n4,n7', 'KaTeX_Fraktur:n4,n7','KaTeX_Main:n4,n7,i4,i7', 'KaTeX_Math:i4,i7', 'KaTeX_Script','KaTeX_SansSerif:n4,n7,i4', 'KaTeX_Size1', 'KaTeX_Size2', 'KaTeX_Size3', 'KaTeX_Size4', 'KaTeX_Typewriter'],
-                    urls: ['${katexcss}']
-                },
-            }
-        </script>
+        ${mathJaxConfigScript}
 
         <style>
         body {
             word-break: normal;
             overflow-wrap: break-word;
+            color: var(--vscode-editor-foreground);
         }
         body:active {
             outline: 1px solid var(--vscode-focusBorder);
+        }
+        .mjx-container {
+            color: var(--vscode-editor-foreground) !important;
         }
         .search {
             position: fixed;
@@ -278,7 +347,7 @@ class DocumentationViewProvider implements vscode.WebviewViewProvider {
         }
         </style>
 
-        <script src=${webfontjs}></script>
+        ${mathJaxScript}
     </head>
 
     <body>
@@ -290,7 +359,7 @@ class DocumentationViewProvider implements vscode.WebviewViewProvider {
                 ${docAsHTML}
             </article>
         </div>
-        <script>
+        <script nonce="${nonce}">
             const vscode = acquireVsCodeApi()
 
             function search(val) {
